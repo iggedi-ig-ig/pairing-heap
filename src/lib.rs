@@ -1,274 +1,264 @@
 use std::{
+    cell::OnceCell,
     collections::VecDeque,
     fmt::{Debug, Display},
-    io::Cursor,
+    vec,
 };
 
-use derive_more::Deref;
-use thiserror::Error;
-
-/// This is what traits a type must implement so it can be used as a key of a [`PairingHeap`].
-pub trait Comparable: Copy + Clone + PartialEq + Eq + PartialOrd + Ord {}
-
-impl<T> Comparable for T where T: Copy + Clone + PartialEq + Eq + PartialOrd + Ord {}
-
-/// A Pairing Heap is an addressable priority queue data structure.
-/// It implements the following operations with their (amortized) time complexities:
-///
-/// # Operations
-/// ## Insert - O(1)
-/// Inserts a new element to the heap, returning a handle to it.
-///
-/// ## Remove - O(log n)
-/// Removes an element from the heap, given a handle to it.
-///
-/// ## Merge - O(1)
-/// Merges two [`PairingHeap`]s into one larger [`PairingHeap`]
-///
-/// ## Get Min - O(1)
-/// Returns the smallest element from the heap
-///
-/// ## Pop Min - O(log n)
-/// Returns the smallest element from the heap and removes it, updating its state accordingly
-///
-/// ## Decrease Key - Exact Complexity unknown, between O(log log n) and O(log n)
-/// Decreases the priority of an element from the heap, given a pointer to it, and the new key.
-#[derive(Default)]
-pub struct PairingHeap<T>
-where
-    T: Comparable,
-{
-    root: Option<*mut PairingHeapNode<T>>,
-    min_ptr: Option<*mut PairingHeapNode<T>>,
-}
-
-#[derive(Deref)]
-pub struct Handle<T>(*mut PairingHeapNode<T>)
-where
-    T: Comparable;
-
-impl<T> PairingHeap<T>
-where
-    T: Comparable,
-{
-    pub fn insert(&mut self, entry: T) -> Handle<T> {
-        self.new_tree(entry)
-    }
-
-    pub fn decrease_key(&mut self, h: Handle<T>, new_key: T) -> Result<(), DecreaseKeyError> {
-        unsafe {
-            let old_key = ***h;
-            if old_key < new_key {
-                return Err(DecreaseKeyError::KeyLarger);
-            }
-
-            (**h).data = new_key;
-
-            if !self.min_ptr.is_some_and(|ptr| **ptr <= new_key) {
-                self.min_ptr = Some(*h);
-            }
-
-            self.cut(h);
-            Ok(())
-        }
-    }
-
-    pub fn remove(&mut self, h: Handle<T>) {
-        unsafe {
-            let ptr = *h;
-        }
-    }
-
-    fn new_tree(&mut self, item: T) -> Handle<T> {
-        let new_root = Box::into_raw(Box::new(PairingHeapNode::new_unlinked(item)));
-
-        if let Some(root) = self.root {
-            // # Safety
-            // This is safe, because
-            // - `new_root` was just created using `Box::into_raw` and thus is not null.
-            // - if `root` is not `None`, then it was created by us, using `Box::into_raw` and thus also is not null.
-            unsafe {
-                (*new_root).right_sibling = Some(root);
-                (*root).left_sibling_or_parent = Some(new_root);
-
-                self.root = Some(new_root);
-
-                if !self
-                    .min_ptr
-                    .is_some_and(|current_min| (**current_min) < item)
-                {
-                    self.min_ptr = Some(new_root);
-                }
-            }
-        } else {
-            self.root = Some(new_root);
-            self.min_ptr = Some(new_root);
-        }
-
-        Handle(new_root)
-    }
-
-    fn cut(&mut self, h: Handle<T>) {
-        unsafe {
-            let ptr = *h;
-
-            if let Some(left_or_parent) = (*ptr).left_sibling_or_parent {
-                if (*left_or_parent)
-                    .one_child
-                    .is_some_and(|child| child == ptr)
-                {
-                    // I represent all chlidren of my parent. Therefore I need to check if there are more children of my parent, and
-                    // if this is the case I need to update my parents child pointer to the next child.
-
-                    if let Some(next_child) = (*ptr).right_sibling {
-                        // I have a sibling to the right of me, therefore I need to update its left_or_parent pointer and my parent's one_child pointer.
-                        (*left_or_parent).one_child = Some(next_child);
-                        (*next_child).left_sibling_or_parent = Some(left_or_parent);
-                    } else {
-                        (*left_or_parent).one_child = None;
-                    }
-                } else {
-                    // if I am not the `one_child` of my parent, I only need to update the children linked list.
-                    if let Some(right) = (*ptr).right_sibling {
-                        (*left_or_parent).right_sibling = Some(right);
-                        (*right).left_sibling_or_parent = Some(left_or_parent);
-                    } else {
-                        // if I don't have a right sibling, my left sibling won't have a right sibling after me being cut out anymore.
-                        (*left_or_parent).right_sibling = None;
-                    }
-                }
-            } else {
-                // If I don't have a parent, I am the left-most root node, thus already a root and therefore don't need to update
-                // my left and right pointers.
-                return;
-            }
-
-            // move sub-tree to be left-most root node.
-            self.insert_left(ptr);
-        }
-    }
-
-    unsafe fn update_min_ptr(&mut self) {
-        let mut curr = self.root;
-        let mut min = self.min_ptr;
-        while let Some(ptr) = curr {
-            if !min.is_some_and(|min_ptr| **min_ptr >= **ptr) {
-                min = Some(ptr);
-            }
-            curr = (*ptr).right_sibling;
-        }
-
-        self.min_ptr = min;
-    }
-
-    unsafe fn pairwise_union(&mut self) {
-        let mut curr = self.root;
-        let mut last = None;
-        while let Some(ptr) = curr {
-            if let Some(last_ptr) = last {
-                self.union(ptr, last_ptr);
-            }
-            last = curr;
-            curr = (*ptr).right_sibling;
-        }
-    }
-
-    unsafe fn union(&mut self, a: *mut PairingHeapNode<T>, b: *mut PairingHeapNode<T>) {
-        if **a > **b {
-            std::ptr::swap(a, b);
-        }
-
-        if let Some(child) = (*a).one_child {
-            // if a has a child already, we just put b as the right child of that.
-        }
-    }
-
-    unsafe fn insert_left(&mut self, node: *mut PairingHeapNode<T>) {
-        if let Some(root) = self.root {
-            (*root).left_sibling_or_parent = Some(node);
-            (*node).right_sibling = Some(root);
-
-            if **node < **root {
-                self.min_ptr = Some(node);
-            }
-        } else {
-            self.root = Some(node);
-            self.min_ptr = Some(node);
-        }
-    }
-}
-
-impl<T> Display for PairingHeap<T>
-where
-    T: Comparable + Display + Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        unsafe {
-            writeln!(f, "{:?}", self.min_ptr.map(|ptr| **ptr))?;
-
-            let mut curr = self.root;
-            while let Some(ptr) = curr {
-                write!(f, "{}\t", **ptr)?;
-                curr = (*ptr).right_sibling;
-            }
-            writeln!(f, "")?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Deref)]
-pub struct PairingHeapNode<T>
-where
-    T: Comparable,
-{
-    #[deref]
-    data: T,
-    left_sibling_or_parent: Option<*mut Self>,
-    right_sibling: Option<*mut Self>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingHeapNode<V: Clone> {
+    key: i32,
+    value: V,
+    left_or_parent: Option<*mut Self>,
+    right: Option<*mut Self>,
     one_child: Option<*mut Self>,
 }
 
-impl<T> PairingHeapNode<T>
-where
-    T: Comparable,
-{
-    pub fn new_unlinked(item: T) -> Self {
+impl<V> Copy for PairingHeapNode<V> where V: Copy + Clone {}
+
+impl<V: Clone> PairingHeapNode<V> {
+    fn new(key: i32, value: V) -> Self {
         Self {
-            data: item,
-            left_sibling_or_parent: None,
-            right_sibling: None,
+            key,
+            value,
+            left_or_parent: None,
+            right: None,
             one_child: None,
         }
     }
 
-    unsafe fn insert_left(&mut self, b: *mut Self) {
-        if let Some(old_left) = self.left_sibling_or_parent {
-            // if I have something left of me, the right pointer of that (which used to be me) has to be updated.
-            (*old_left).right_sibling = Some(b);
-            self.left_sibling_or_parent = Some(b);
-            (*b).right_sibling = (*old_left).right_sibling;
+    unsafe fn insert_right(&mut self, right: *mut Self) {
+        if let Some(old_right) = self.right {
+            (*old_right).left_or_parent = Some(right);
+            (*right).left_or_parent = Some(self as *mut Self);
+            (*right).right = Some(old_right);
+            self.right = Some(right);
+        } else {
+            self.right = Some(right);
+            (*right).left_or_parent = Some(self as *mut Self);
         }
+    }
+
+    unsafe fn insert_child(&mut self, child: *mut Self) {
+        if let Some(one_child) = self.one_child {
+            self.one_child = Some(child);
+            (*child).insert_right(one_child);
+        } else {
+            (*child).left_or_parent = Some(self as _);
+            self.one_child = Some(child);
+        }
+    }
+
+    // returns the child pointer, because that has to be attached somewhere else manually.
+    unsafe fn destroy(&mut self) -> Option<*mut Self> {
+        let left_or_parent = self.left_or_parent;
+        let right = self.right;
+        let one_child = self.one_child;
+
+        if let Some(left_or_parent) = left_or_parent {
+            if self.is_left_parent() {
+                if let Some(child) = one_child {
+                    (*left_or_parent).insert_child(child);
+                } else {
+                    (*left_or_parent).one_child = None;
+                }
+            } else {
+                (*left_or_parent).right = right;
+            }
+        }
+
+        if let Some(right) = right {
+            (*right).left_or_parent = left_or_parent;
+        }
+
+        one_child
+    }
+
+    fn is_left_parent(&self) -> bool {
+        !self
+            .left_or_parent
+            .is_some_and(|pointer| pointer as *const _ != self as *const _)
+    }
+
+    fn siblings_iter<'a>(&'a mut self) -> SiblingsRightIter<V> {
+        SiblingsRightIter {
+            current: Some(self as _),
+        }
+    }
+
+    pub fn key(&self) -> i32 {
+        self.key
+    }
+
+    pub fn value(&self) -> &V {
+        &self.value
+    }
+
+    pub fn key_value(&self) -> (i32, V) {
+        (self.key, self.value.clone())
     }
 }
 
-/// This enum represents the possilbe errors that can occurr in an invocation of `decrease_key` on a [`PairingHeap`].
-#[derive(Error, Debug)]
-pub enum DecreaseKeyError {
-    #[error("The new key was larger than the original key.")]
-    KeyLarger,
+impl<V: Clone + Debug> Display for PairingHeapNode<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.key_value())
+    }
 }
 
-#[test]
-fn test() {
-    let mut heap = PairingHeap::default();
+/// An [`Iterator`] over all children of a given [`PairingHeapNode`].
+/// They are traversed in bfs order.
+pub struct ChildIter<'a, V: Clone> {
+    stack: VecDeque<&'a PairingHeapNode<V>>,
+}
 
-    heap.insert(5usize);
-    heap.insert(4);
-    heap.insert(3);
-    let ten = heap.insert(10);
+impl<'a, V: Clone> Iterator for ChildIter<'a, V> {
+    type Item = &'a PairingHeapNode<V>;
 
-    heap.decrease_key(ten, 1).unwrap();
+    fn next(&mut self) -> Option<Self::Item> {
+        let front = self.stack.pop_front();
+        front
+    }
+}
 
-    println!("{}", heap);
+/// An [`Iterator`] over all siblings to the right of a given [`PairingHeapNode`].
+pub struct SiblingsRightIter<V: Clone> {
+    current: Option<*mut PairingHeapNode<V>>,
+}
+
+impl<V: Clone> Iterator for SiblingsRightIter<V> {
+    type Item = PairingHeapNode<V>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.current;
+        self.current = current.and_then(|node| unsafe { (*node).right });
+        current
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PairingHeap<V: Clone> {
+    root: Option<*mut PairingHeapNode<V>>,
+    curr_min: Option<*mut PairingHeapNode<V>>,
+}
+
+impl<V: Clone> PairingHeap<V> {
+    /// Creates a new, empty [`PairingHeap`]
+    pub fn new() -> Self {
+        Self {
+            root: None,
+            curr_min: None,
+        }
+    }
+
+    /// Inserts a new element to the heap.
+    /// Runtime Complexity: O(1)
+    pub fn insert(&mut self, key: i32, value: V) -> *mut PairingHeapNode<V> {
+        let node = Box::into_raw(Box::new(PairingHeapNode::new(key, value)));
+
+        if let Some(root) = self.root {
+            self.root = Some(node);
+            unsafe {
+                (*node).insert_right(root);
+                self.update_min(node);
+            }
+        } else {
+            self.root = Some(node);
+            self.curr_min = Some(node);
+        }
+        node
+    }
+
+    /// Removes an element from the heap, returning it if it was present.
+    /// Runtime complexity: Between O(log log n) and O(log n)
+    pub fn remove(&mut self, element: *mut PairingHeapNode<V>) -> Option<(i32, V)> {
+        if let Some(children) = unsafe { (*element).destroy() } {}
+
+        // drop element
+        self.pairwise_union();
+        todo!()
+    }
+
+    /// Returns the smallest element from the heap.
+    /// Runtime complexity: O(1)
+    pub fn get_min(&self) -> Option<(i32, V)> {
+        unsafe { self.curr_min.map(|min| (*min).key_value()) }
+    }
+
+    /// Returns the smallest element from the heap, removing it from it in the process.
+    /// Runtime complexity: Between O(log log n) and O(log n)
+    pub fn pop_min(&mut self) -> Option<(i32, V)> {
+        self.pairwise_union();
+        todo!()
+    }
+
+    /// Decreases the key of a given element of the heap.
+    /// Runtime complexity: O(1)
+    pub fn decrease_key(&mut self, new_key: i32, handle: *mut PairingHeapNode<V>) {
+        todo!()
+    }
+
+    /// Merges two [`PairingHeap`]s into one, returning it.
+    /// Runtime complecity: O(1)
+    pub fn merge(mut self, mut other: Self) -> Self {
+        todo!()
+    }
+
+    /// Returns an iterator over the roots of this [`PairingHeap`].
+    pub fn roots_iter<'a>(&self) -> SiblingsRightIter<V> {
+        SiblingsRightIter {
+            current: self.root.map(|root| unsafe { &*root }),
+        }
+    }
+
+    fn pairwise_union(&mut self) {
+        let mut last = None;
+        let mut iter = self.roots_iter_mut();
+
+        while let Some(next) = iter.next() {
+            if let Some(previous) = last {
+                last = None;
+            } else {
+                last = Some(next)
+            }
+        }
+    }
+
+    unsafe fn update_min(&mut self, new_element: *mut PairingHeapNode<V>) {
+        self.curr_min = Some(self.curr_min.map_or(new_element, |value| {
+            if (*value).key() > (*new_element).key() {
+                value
+            } else {
+                new_element
+            }
+        }))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::PairingHeap;
+
+    #[test]
+    fn test_roots() {
+        let mut pairing_heap = PairingHeap::new();
+
+        pairing_heap.insert(5, "world");
+        pairing_heap.insert(4, "hello");
+        pairing_heap.insert(6, "hello");
+        pairing_heap.insert(4, "yeah");
+        pairing_heap.insert(1, "smol");
+
+        let mut roots_iter = pairing_heap.roots_iter();
+
+        assert_eq!(roots_iter.next().map(|node| *node.value()), Some("smol"));
+        assert_eq!(roots_iter.next().map(|node| *node.value()), Some("yeah"));
+        assert_eq!(roots_iter.next().map(|node| *node.value()), Some("hello"));
+        assert_eq!(roots_iter.next().map(|node| *node.value()), Some("hello"));
+        assert_eq!(roots_iter.next().map(|node| *node.value()), Some("world"));
+        assert_eq!(roots_iter.next(), None);
+
+        for root in pairing_heap.roots_iter() {
+            println!("{}", root);
+        }
+    }
 }
