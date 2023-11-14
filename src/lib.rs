@@ -74,6 +74,14 @@ impl<V: Clone> PairingHeapNode<V> {
         one_child
     }
 
+    unsafe fn union(a: *mut Self, b: *mut Self) {
+        if (*a).key() > (*b).key() {
+            std::ptr::swap(a, b);
+        }
+
+        (*a).insert_child(b);
+    }
+
     fn is_left_parent(&self) -> bool {
         !self
             .left_or_parent
@@ -126,7 +134,7 @@ pub struct SiblingsRightIter<V: Clone> {
 }
 
 impl<V: Clone> Iterator for SiblingsRightIter<V> {
-    type Item = PairingHeapNode<V>;
+    type Item = *mut PairingHeapNode<V>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.current;
@@ -188,6 +196,7 @@ impl<V: Clone> PairingHeap<V> {
     /// Runtime complexity: Between O(log log n) and O(log n)
     pub fn pop_min(&mut self) -> Option<(i32, V)> {
         self.pairwise_union();
+        self.find_new_min();
         todo!()
     }
 
@@ -198,24 +207,25 @@ impl<V: Clone> PairingHeap<V> {
     }
 
     /// Merges two [`PairingHeap`]s into one, returning it.
-    /// Runtime complecity: O(1)
+    /// Runtime complexity: O(1)
     pub fn merge(mut self, mut other: Self) -> Self {
+        let mut new_root = self.root.or(other.root);
+
         todo!()
     }
 
     /// Returns an iterator over the roots of this [`PairingHeap`].
     pub fn roots_iter<'a>(&self) -> SiblingsRightIter<V> {
-        SiblingsRightIter {
-            current: self.root.map(|root| unsafe { &*root }),
-        }
+        SiblingsRightIter { current: self.root }
     }
 
     fn pairwise_union(&mut self) {
         let mut last = None;
-        let mut iter = self.roots_iter_mut();
+        let mut iter = self.roots_iter().collect::<Vec<_>>().into_iter();
 
         while let Some(next) = iter.next() {
             if let Some(previous) = last {
+                unsafe { PairingHeapNode::union(next, previous) };
                 last = None;
             } else {
                 last = Some(next)
@@ -231,6 +241,10 @@ impl<V: Clone> PairingHeap<V> {
                 new_element
             }
         }))
+    }
+
+    fn find_new_min(&mut self) {
+        self.curr_min = self.roots_iter().min_by_key(|ptr| unsafe { (**ptr).key() });
     }
 }
 
@@ -248,7 +262,7 @@ mod test {
         pairing_heap.insert(4, "yeah");
         pairing_heap.insert(1, "smol");
 
-        let mut roots_iter = pairing_heap.roots_iter();
+        let mut roots_iter = pairing_heap.roots_iter().map(|ptr| unsafe { &*ptr });
 
         assert_eq!(roots_iter.next().map(|node| *node.value()), Some("smol"));
         assert_eq!(roots_iter.next().map(|node| *node.value()), Some("yeah"));
@@ -257,7 +271,7 @@ mod test {
         assert_eq!(roots_iter.next().map(|node| *node.value()), Some("world"));
         assert_eq!(roots_iter.next(), None);
 
-        for root in pairing_heap.roots_iter() {
+        for root in pairing_heap.roots_iter().map(|ptr| unsafe { &*ptr }) {
             println!("{}", root);
         }
     }
